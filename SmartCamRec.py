@@ -110,17 +110,37 @@ def free_port(port):
     except (subprocess.CalledProcessError, PermissionError, ValueError) as e:
         print(f"❌ Error while trying to free port {port}: {e}")
 
-def apply_overlay_to_buffer(buffer_segments, config, device_name):
+def apply_overlay_to_buffer(buffer_segments, config, device_name, match_params):
     """
-    Re-encodes a list of video segments to add a text overlay.
-    This is CPU-intensive.
-    Returns a list of paths to the new, encoded segment files.
+    Re-encodes the pre-event buffer segments to burn in a text overlay, encoding
+    them to MATCH the main event file's video format (codec + pixel format). That
+    lets the overlay'd pre-roll concat with the stream-copied event file WITHOUT
+    ever re-encoding the large, full-quality event file (we match the small buffer
+    to the big event, never the other way around).
+
+    match_params is the dict from probe_video_params(<event file>). If we can't
+    read the event's pixel format we can't guarantee a concat-compatible result,
+    so we skip the overlay (returning the originals) rather than produce segments
+    that won't merge. Returns a list of segment paths: the new overlay segments on
+    success, or the originals if there's no overlay text, a probe gap, or an encode
+    failure (all of which still concat cleanly, just without the overlay).
     """
     overlay_text = config.get('recording', 'pre_event_overlay', fallback=None)
     if not overlay_text:
         return buffer_segments # Return the original list if no overlay is set
 
-    print(f"{device_name}: Applying '{overlay_text}' overlay to pre-event buffer...")
+    # Match the EVENT file's video format. pix_fmt is the usual concat-breaker
+    # (e.g. camera yuvj420p vs x264's default yuv420p); codec keeps both sides the
+    # same stream type. Without these we can't guarantee a clean merge, so bail to
+    # the originals rather than risk it.
+    pix_fmt = (match_params or {}).get('pix_fmt')
+    codec_name = (match_params or {}).get('codec_name', 'h264')
+    if not pix_fmt:
+        print(f"{device_name}: Couldn't read event video format; skipping pre-event overlay to keep the splice safe.")
+        return buffer_segments
+    venc = 'libx265' if codec_name == 'hevc' else 'libx264'
+
+    print(f"{device_name}: Applying '{overlay_text}' overlay (matching event format {codec_name}/{pix_fmt})...")
 
     # Create a new directory in RAM to store the encoded segments
     encoded_buffer_dir = f"/dev/shm/cctv_buffer_{device_name}_encoded"
@@ -145,10 +165,12 @@ def apply_overlay_to_buffer(buffer_segments, config, device_name):
             ffmpeg_command = [
                 'ffmpeg',
                 '-i', segment_path,
-                # Re-encode video to apply the filter
-                '-c:v', 'libx264',
+                # Re-encode video to apply the filter, matching the event file's
+                # codec and pixel format so the two can later concat with -c copy.
+                '-c:v', venc,
                 '-preset', 'veryfast', # Fast encoding preset
                 '-crf', '23',         # Decent quality
+                '-pix_fmt', pix_fmt,  # <-- MATCH the event file (the usual concat-breaker)
                 '-vf', f"drawtext=text='{overlay_text}':fontcolor=white:fontsize=h/15:box=1:boxcolor=black@0.5:x=10:y=h-th-10",
                 # Copy the audio stream without re-encoding
                 '-c:a', 'copy',
@@ -159,7 +181,7 @@ def apply_overlay_to_buffer(buffer_segments, config, device_name):
             encoded_segments.append(output_path)
         except Exception as e:
             print(f"❌ FAILED to apply overlay to segment {segment_path}. Error: {e}")
-            # If one fails, we should probably stop and use the original buffer
+            # If one fails, fall back to the originals (still concat-safe, no overlay)
             return buffer_segments
 
     #print(f"✅ Overlay applied to {len(encoded_segments)} segments.")
@@ -307,6 +329,33 @@ def get_video_duration(video_path):
     except Exception as e:
         print(f"❌ FAILED to probe video duration. Error: {e}")
         return None
+
+def probe_video_params(video_path):
+    """
+    Returns a dict of the first video stream's key parameters (codec_name,
+    pix_fmt) for `video_path`, or {} on failure.
+
+    Used to encode the overlay'd pre-event segments to MATCH the main event file,
+    so the two can be concatenated with -c copy without ever re-encoding the
+    (large, full-quality) event file.
+    """
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'error',
+             '-select_streams', 'v:0',
+             '-show_entries', 'stream=codec_name,pix_fmt',
+             '-of', 'default=noprint_wrappers=1', video_path],
+            capture_output=True, text=True, check=True
+        )
+        params = {}
+        for line in result.stdout.strip().splitlines():
+            if '=' in line:
+                k, v = line.split('=', 1)
+                params[k.strip()] = v.strip()
+        return params
+    except Exception as e:
+        print(f"❌ FAILED to probe video params. Error: {e}")
+        return {}
 
 def reencode_video_2pass(video_path, output_video_path, res, target_size_mb):
     """
@@ -840,24 +889,15 @@ def record_video(device_name, ip_address, config, TrigType):
                 #        still-running buffer can't overwrite them under us. ---
                 segment_files = list(snapshot_segments)
 
-                # --- B. Check for and apply overlay ---
-                segment_files_for_concat = apply_overlay_to_buffer(segment_files, config, device_name)
+                # --- B. Overlay the pre-event segments, encoded to MATCH the event
+                #        file. We probe the event file's format and hand it to
+                #        apply_overlay_to_buffer, so the overlay'd pre-roll and the
+                #        stream-copied event file concat cleanly. The event file is
+                #        NEVER re-encoded - matching goes the other way around. ---
+                event_params = probe_video_params(temp_event_ts)
+                segment_files_for_concat = apply_overlay_to_buffer(segment_files, config, device_name, event_params)
 
                 event_file_for_concat = temp_event_ts
-
-                # --- C. CHECK FOR CODEC MISMATCH ---
-                if segment_files_for_concat is not segment_files:
-                    # We must re-encode the main event file to match the buffer's new codec
-                    print(f"{device_name}: Re-encoding event file to match overlay codec...")
-                    reencoded_event_ts = os.path.join(device_folder, "temp_event_reencoded.ts")
-                    ffmpeg_command = [
-                        'ffmpeg', '-i', temp_event_ts,
-                        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
-                        '-c:a', 'copy',
-                        '-y', reencoded_event_ts
-                    ]
-                    subprocess.run(ffmpeg_command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    event_file_for_concat = reencoded_event_ts
 
                 # --- D. Create the concat_list.txt file (FIXED) ---
                 with open(concat_list_path, 'w') as f:
@@ -881,9 +921,9 @@ def record_video(device_name, ip_address, config, TrigType):
                 input_for_repackaging = combined_ts_file
 
                 # --- F. Clean up intermediate files ---
+                # The event file is only ever stream-copied (never a separate
+                # re-encoded copy now), so there's just the one to remove.
                 os.remove(temp_event_ts)
-                if event_file_for_concat != temp_event_ts:
-                    os.remove(event_file_for_concat)
                 # concat_list.txt lives in the snapshot dir and is removed with it.
 
             except Exception as e:
