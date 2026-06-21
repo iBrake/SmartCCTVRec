@@ -935,7 +935,7 @@ def record_video(device_name, ip_address, config, TrigType):
         # cycles (or leave orphaned temp files) encoding video we'll never send.
         video_to_attach = None
         if is_within_alert_window() and is_email_zone(device_name):
-            print(f"{device_name}: In email window and on the alarm-email zone list. Preparing email + video.")
+            print(f"{device_name}: In email window and zone allowed to email. Preparing email + video.")
             temp_folder = os.path.join(base_location, "temp")
             vid_quality = config.get('attachments', 'vid_attach_res', fallback='off')
             if vid_quality in ['720', '1080']:
@@ -976,6 +976,11 @@ def record_video(device_name, ip_address, config, TrigType):
             )
             email_thread.start()
 
+        # Terminal log line for the recording thread, so the journal clearly shows
+        # the event finished rather than appearing to hang on the last step (e.g.
+        # "Repackaging...") whenever no email is sent. If an email WAS sent it runs
+        # in its own thread and logs its own completion separately.
+        print(f"{device_name}: Event processing complete.")
 
 
 def extract_field(raw, key):
